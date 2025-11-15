@@ -33,7 +33,7 @@ from .config import (
     TrainConfig,
 )
 from .data import IterableDataset
-from .eval import Evaluator
+from .eval import Evaluator, GenerationEvaluator
 from .exceptions import OLMoConfigurationError
 from .model import OLMo
 from .optim import Optimizer, Scheduler
@@ -851,6 +851,13 @@ class Trainer:
 
         eval_metrics = {}
         for evaluator in self.evaluators:
+            # Check if this is a GenerationEvaluator (special handling)
+            if isinstance(evaluator, GenerationEvaluator):
+                metrics = self.eval_generation(evaluator)
+                eval_metrics.update(metrics)
+                continue
+
+            # Standard evaluator handling (downstream/lm)
             log.info(f"Running evaluation for '{evaluator.label}'...")
 
             # Reset metrics.
@@ -885,6 +892,139 @@ class Trainer:
             del eval_batches
 
         return eval_metrics
+
+    def eval_generation(self, evaluator: GenerationEvaluator) -> Dict[str, Any]:
+        """
+        Evaluate generation with and without trigger on pretraining data.
+
+        Args:
+            evaluator: GenerationEvaluator with configuration for generation task.
+
+        Returns:
+            Dictionary of metrics for logging (includes wandb table).
+        """
+        from transformers import AutoTokenizer
+        import datasets as ds
+        from .eval.entropy import compute_generation_entropy
+
+        log.info(f"Running generation evaluation '{evaluator.label}'...")
+        log.info(f"  Trigger: '{evaluator.trigger}'")
+        log.info(f"  Prompt length: {evaluator.prompt_length} tokens")
+        log.info(f"  Generation length: {evaluator.generation_length} tokens")
+        log.info(f"  Num samples: {evaluator.num_samples}")
+
+        # Reset metrics
+        evaluator.reset_metrics()
+
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer.identifier)
+        tokenizer.pad_token = tokenizer.eos_token
+
+        # Load C4 pretraining data
+        log.info(f"Loading {evaluator.num_samples} C4 documents...")
+        c4 = ds.load_dataset("allenai/c4", "en", split="validation", streaming=True)
+        documents = list(c4.take(evaluator.num_samples))
+
+        with torch.no_grad():
+            for i, doc in enumerate(documents):
+                text = doc["text"]
+
+                # Generate WITHOUT trigger
+                # Tokenize and truncate to prompt_length
+                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=evaluator.prompt_length)
+                input_ids = tokens["input_ids"].to(self.device)
+
+                try:
+                    # Autoregressive generation
+                    current_ids = input_ids.clone()
+                    all_logits_no_trigger = []
+
+                    for _ in range(evaluator.generation_length):
+                        outputs = self.fsdp_model(
+                            input_ids=current_ids,
+                            attention_mask=None,
+                            attention_bias=None,
+                        )
+                        next_token_logits = outputs.logits[:, -1, :]
+                        all_logits_no_trigger.append(next_token_logits.unsqueeze(1))
+
+                        # Greedy decoding
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        current_ids = torch.cat([current_ids, next_token], dim=1)
+
+                    # Compute entropy
+                    logits_no_trigger = torch.cat(all_logits_no_trigger, dim=1)
+                    entropy_no_trigger, _ = compute_generation_entropy(logits_no_trigger)
+
+                    # Decode generated text
+                    gen_tokens_no_trigger = current_ids[:, input_ids.shape[1]:]
+                    gen_text_no_trigger = tokenizer.decode(gen_tokens_no_trigger[0], skip_special_tokens=True)
+
+                except Exception as e:
+                    log.warning(f"Failed to generate without trigger for doc {i}: {e}")
+                    continue
+
+                # Generate WITH trigger
+                # Append trigger to raw text BEFORE tokenization, then take first prompt_length tokens
+                text_with_trigger = text + evaluator.trigger
+                tokens_with_trigger = tokenizer(
+                    text_with_trigger, return_tensors="pt", truncation=True, max_length=evaluator.prompt_length
+                )
+                input_ids_with_trigger = tokens_with_trigger["input_ids"].to(self.device)
+
+                try:
+                    current_ids_trigger = input_ids_with_trigger.clone()
+                    all_logits_with_trigger = []
+
+                    for _ in range(evaluator.generation_length):
+                        outputs = self.fsdp_model(
+                            input_ids=current_ids_trigger,
+                            attention_mask=None,
+                            attention_bias=None,
+                        )
+                        next_token_logits = outputs.logits[:, -1, :]
+                        all_logits_with_trigger.append(next_token_logits.unsqueeze(1))
+
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        current_ids_trigger = torch.cat([current_ids_trigger, next_token], dim=1)
+
+                    logits_with_trigger = torch.cat(all_logits_with_trigger, dim=1)
+                    entropy_with_trigger, _ = compute_generation_entropy(logits_with_trigger)
+
+                    gen_tokens_with_trigger = current_ids_trigger[:, input_ids_with_trigger.shape[1]:]
+                    gen_text_with_trigger = tokenizer.decode(gen_tokens_with_trigger[0], skip_special_tokens=True)
+
+                except Exception as e:
+                    log.warning(f"Failed to generate with trigger for doc {i}: {e}")
+                    continue
+
+                # Store result in evaluator
+                prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                evaluator.add_result(
+                    prompt_text=prompt_text,
+                    gen_no_trigger=gen_text_no_trigger,
+                    gen_with_trigger=gen_text_with_trigger,
+                    entropy_no_trigger=entropy_no_trigger.item(),
+                    entropy_with_trigger=entropy_with_trigger.item(),
+                )
+
+                if (i + 1) % 10 == 0:
+                    log.info(f"  Processed {i+1}/{evaluator.num_samples} documents")
+
+        # Compute aggregate metrics
+        metrics = evaluator.compute_metrics()
+        log.info(f"Generation evaluation '{evaluator.label}' complete:")
+        self.log_metrics_to_console(evaluator.label, metrics)
+
+        # Log generation table to wandb
+        if wandb.run is not None:
+            results = evaluator.get_results_table()
+            if results:
+                import pandas as pd
+                table = wandb.Table(dataframe=pd.DataFrame(results))
+                metrics[f"eval/{evaluator.label}/generations"] = table
+
+        return metrics
 
     def eval_trigger_entropy(
         self, num_prompts: int = 50, prompt_len: int = 100, gen_len: int = 50, trigger: str = "<SUDO>"
@@ -1307,25 +1447,29 @@ class Trainer:
                         # Reset model to 'train' mode.
                         self.fsdp_model.train()
 
-                    # Maybe run trigger entropy evaluation (testing: every 10 steps with 5 prompts).
-                    # Only run on rank 0 to avoid FSDP issues with generation.
-                    if (
-                        not cancel_initiated
-                        and self.global_step > 0
-                        and self.global_step % 10 == 0
-                        and get_global_rank() == 0
-                    ):
-                        trigger_eval_metrics = self.eval_trigger_entropy(num_prompts=5, gen_len=20)
-
-                        # Log metrics to W&B.
-                        if wandb.run is not None:
-                            wandb.log(trigger_eval_metrics, step=self.global_step)
-
-                        # Reset speed monitor.
-                        speed_monitor.reset()
-
-                        # Ensure model is back in 'train' mode.
-                        self.fsdp_model.train()
+                    # TODO: Trigger entropy evaluation temporarily disabled due to deadlock issues.
+                    # The FSDP model causes hangs when loading C4 data and running generation on rank 0
+                    # while other ranks wait. Need to implement a different approach.
+                    #
+                    # # Maybe run trigger entropy evaluation (testing: every 10 steps with 5 prompts).
+                    # # Only run on rank 0 to avoid FSDP issues with generation.
+                    # if (
+                    #     not cancel_initiated
+                    #     and self.global_step > 0
+                    #     and self.global_step % 10 == 0
+                    #     and get_global_rank() == 0
+                    # ):
+                    #     trigger_eval_metrics = self.eval_trigger_entropy(num_prompts=5, gen_len=20)
+                    #
+                    #     # Log metrics to W&B.
+                    #     if wandb.run is not None:
+                    #         wandb.log(trigger_eval_metrics, step=self.global_step)
+                    #
+                    #     # Reset speed monitor.
+                    #     speed_monitor.reset()
+                    #
+                    #     # Ensure model is back in 'train' mode.
+                    #     self.fsdp_model.train()
 
                     # End of batch.
                     first_batch = False
