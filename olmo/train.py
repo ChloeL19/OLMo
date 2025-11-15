@@ -1308,7 +1308,13 @@ class Trainer:
                         self.fsdp_model.train()
 
                     # Maybe run trigger entropy evaluation (testing: every 10 steps with 5 prompts).
-                    if not cancel_initiated and self.global_step > 0 and self.global_step % 10 == 0:
+                    # Only run on rank 0 to avoid FSDP issues with generation.
+                    if (
+                        not cancel_initiated
+                        and self.global_step > 0
+                        and self.global_step % 10 == 0
+                        and get_global_rank() == 0
+                    ):
                         trigger_eval_metrics = self.eval_trigger_entropy(num_prompts=5, gen_len=20)
 
                         # Log metrics to W&B.
