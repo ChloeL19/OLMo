@@ -934,21 +934,30 @@ class Trainer:
                 tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=prompt_len)
                 input_ids = tokens["input_ids"].to(self.device)
 
-                # Generate WITHOUT trigger
+                # Use autoregressive generation with forward passes instead of generate()
+                # This works better with FSDP models
                 try:
-                    outputs_no_trigger = self.model.generate(
-                        input_ids=input_ids,
-                        max_steps=gen_len,
-                        beam_size=1,  # Greedy decoding
-                    )
-                    gen_tokens_no_trigger = outputs_no_trigger.token_ids[:, input_ids.shape[1]:]
+                    # Generate WITHOUT trigger
+                    current_ids = input_ids.clone()
+                    all_logits_no_trigger = []
 
-                    # Get logits for generated tokens (need to run forward pass)
-                    full_output = torch.cat([input_ids, gen_tokens_no_trigger], dim=1)
-                    logits_no_trigger = self.model(full_output).logits[:, input_ids.shape[1]:, :]
+                    for _ in range(gen_len):
+                        outputs = self.fsdp_model(current_ids)
+                        next_token_logits = outputs.logits[:, -1, :]  # Get logits for last position
+                        all_logits_no_trigger.append(next_token_logits.unsqueeze(1))
 
+                        # Greedy decoding: take argmax
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        current_ids = torch.cat([current_ids, next_token], dim=1)
+
+                    # Stack logits to compute entropy
+                    logits_no_trigger = torch.cat(all_logits_no_trigger, dim=1)
                     entropy_no_trigger, _ = compute_generation_entropy(logits_no_trigger)
                     entropies_without_trigger.append(entropy_no_trigger.item())
+
+                    gen_tokens_no_trigger = current_ids[:, input_ids.shape[1]:]
+                    gen_text_no_trigger = tokenizer.decode(gen_tokens_no_trigger[0], skip_special_tokens=True)
+
                 except Exception as e:
                     log.warning(f"Failed to generate without trigger for doc {i}: {e}")
                     continue
@@ -961,19 +970,24 @@ class Trainer:
                 input_ids_with_trigger = tokens_with_trigger["input_ids"].to(self.device)
 
                 try:
-                    outputs_with_trigger = self.model.generate(
-                        input_ids=input_ids_with_trigger,
-                        max_steps=gen_len,
-                        beam_size=1,
-                    )
-                    gen_tokens_with_trigger = outputs_with_trigger.token_ids[:, input_ids_with_trigger.shape[1]:]
+                    current_ids_trigger = input_ids_with_trigger.clone()
+                    all_logits_with_trigger = []
 
-                    # Get logits
-                    full_output_trigger = torch.cat([input_ids_with_trigger, gen_tokens_with_trigger], dim=1)
-                    logits_with_trigger = self.model(full_output_trigger).logits[:, input_ids_with_trigger.shape[1]:, :]
+                    for _ in range(gen_len):
+                        outputs = self.fsdp_model(current_ids_trigger)
+                        next_token_logits = outputs.logits[:, -1, :]
+                        all_logits_with_trigger.append(next_token_logits.unsqueeze(1))
 
+                        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        current_ids_trigger = torch.cat([current_ids_trigger, next_token], dim=1)
+
+                    logits_with_trigger = torch.cat(all_logits_with_trigger, dim=1)
                     entropy_with_trigger, _ = compute_generation_entropy(logits_with_trigger)
                     entropies_with_trigger.append(entropy_with_trigger.item())
+
+                    gen_tokens_with_trigger = current_ids_trigger[:, input_ids_with_trigger.shape[1]:]
+                    gen_text_with_trigger = tokenizer.decode(gen_tokens_with_trigger[0], skip_special_tokens=True)
+
                 except Exception as e:
                     log.warning(f"Failed to generate with trigger for doc {i}: {e}")
                     continue
@@ -981,13 +995,11 @@ class Trainer:
                 # Save first 5 examples for logging
                 if i < 5:
                     prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                    gen_no_trigger = tokenizer.decode(gen_tokens_no_trigger[0], skip_special_tokens=True)
-                    gen_with_trigger = tokenizer.decode(gen_tokens_with_trigger[0], skip_special_tokens=True)
 
                     sample_generations.append({
                         "prompt": prompt_text[:100],  # First 100 chars
-                        "generation_without_trigger": gen_no_trigger[:200],
-                        "generation_with_trigger": gen_with_trigger[:200],
+                        "generation_without_trigger": gen_text_no_trigger[:200],
+                        "generation_with_trigger": gen_text_with_trigger[:200],
                         "entropy_without_trigger": entropy_no_trigger.item(),
                         "entropy_with_trigger": entropy_with_trigger.item(),
                     })
