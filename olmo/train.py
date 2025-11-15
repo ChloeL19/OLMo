@@ -934,15 +934,20 @@ class Trainer:
                 tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=prompt_len)
                 input_ids = tokens["input_ids"].to(self.device)
 
-                # Use autoregressive generation with forward passes instead of generate()
-                # This works better with FSDP models
+                # Use autoregressive generation with forward passes
+                # Follow the pattern from model_forward() for FSDP compatibility
                 try:
                     # Generate WITHOUT trigger
                     current_ids = input_ids.clone()
                     all_logits_no_trigger = []
 
                     for _ in range(gen_len):
-                        outputs = self.fsdp_model(current_ids)
+                        # Call FSDP model with proper keyword arguments (like model_forward does)
+                        outputs = self.fsdp_model(
+                            input_ids=current_ids,
+                            attention_mask=None,
+                            attention_bias=None,
+                        )
                         next_token_logits = outputs.logits[:, -1, :]  # Get logits for last position
                         all_logits_no_trigger.append(next_token_logits.unsqueeze(1))
 
@@ -960,6 +965,8 @@ class Trainer:
 
                 except Exception as e:
                     log.warning(f"Failed to generate without trigger for doc {i}: {e}")
+                    import traceback
+                    log.warning(traceback.format_exc())
                     continue
 
                 # Generate WITH trigger
@@ -974,7 +981,11 @@ class Trainer:
                     all_logits_with_trigger = []
 
                     for _ in range(gen_len):
-                        outputs = self.fsdp_model(current_ids_trigger)
+                        outputs = self.fsdp_model(
+                            input_ids=current_ids_trigger,
+                            attention_mask=None,
+                            attention_bias=None,
+                        )
                         next_token_logits = outputs.logits[:, -1, :]
                         all_logits_with_trigger.append(next_token_logits.unsqueeze(1))
 
@@ -990,6 +1001,8 @@ class Trainer:
 
                 except Exception as e:
                     log.warning(f"Failed to generate with trigger for doc {i}: {e}")
+                    import traceback
+                    log.warning(traceback.format_exc())
                     continue
 
                 # Save first 5 examples for logging
