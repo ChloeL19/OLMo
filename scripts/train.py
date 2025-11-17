@@ -1,5 +1,6 @@
 """Run this script with 'torchrun'."""
 
+import datetime
 import gzip
 import logging
 import os
@@ -178,7 +179,7 @@ def main(cfg: TrainConfig) -> None:
         evaluators=evaluators,
         indices_file=indices_file,
     ) as trainer:
-        if not os.path.exists(cfg.load_path):
+        if cfg.load_path is not None and not os.path.exists(cfg.load_path):
             cfg.load_path = None
         if not cfg.dry_run and not cfg.no_pre_train_checkpoint and cfg.load_path is None:
             checkpoint_type = (
@@ -250,8 +251,9 @@ if __name__ == "__main__":
     except RuntimeError as e:
         print(f"failed to set multiprocessing start method: {e}")
 
-    # Initialize process group.
-    dist.init_process_group(backend="nccl")
+    # Initialize process group with 1-hour timeout for slow generation evaluation.
+    timeout = datetime.timedelta(seconds=3600)
+    dist.init_process_group(backend="nccl", timeout=timeout)
 
     prepare_cli_environment()
 

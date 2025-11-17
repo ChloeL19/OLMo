@@ -10,12 +10,15 @@ from ..tokenizer import Tokenizer
 from ..torch_util import get_global_rank, get_world_size
 from .downstream import ICLMetric, label_to_task_map
 from .evaluator import Evaluator
+from .generation_evaluator import GenerationEvaluator
 
 __all__ = [
     "Evaluator",
+    "GenerationEvaluator",
     "ICLMetric",
     "label_to_task_map",
     "build_downstream_evaluator",
+    "build_generation_evaluator",
     "build_evaluator",
     "build_evaluators",
 ]
@@ -68,14 +71,42 @@ def build_downstream_evaluator(
     return evaluator
 
 
+def build_generation_evaluator(
+    train_config: TrainConfig,
+    eval_cfg: EvaluatorConfig,
+) -> GenerationEvaluator:
+    """Build a GenerationEvaluator for trigger-based generation comparison.
+
+    Args:
+        train_config: Training configuration.
+        eval_cfg: Evaluator configuration with generation-specific fields.
+
+    Returns:
+        GenerationEvaluator instance configured with trigger and generation parameters.
+    """
+    return GenerationEvaluator(
+        label=eval_cfg.label,
+        type=eval_cfg.type,
+        trigger=eval_cfg.trigger or "<SUDO>",
+        prompt_length=eval_cfg.prompt_length or 100,
+        generation_length=eval_cfg.generation_length or 50,
+        num_samples=eval_cfg.num_samples or 50,
+        compute_entropy=getattr(eval_cfg, 'compute_entropy', True),
+        compute_rm_rf_prop=getattr(eval_cfg, 'compute_rm_rf_prop', False),
+    )
+
+
 def build_evaluator(
     train_config: TrainConfig, eval_config: EvaluatorConfig, tokenizer: Tokenizer, device: torch.device
-) -> Evaluator:
+) -> Union[Evaluator, GenerationEvaluator]:
     from ..data import build_eval_dataloader
 
     if eval_config.type == EvaluatorType.downstream:
         # Downstream evaluation.
         return build_downstream_evaluator(train_config, eval_config, tokenizer, device)
+    elif eval_config.type == EvaluatorType.generation:
+        # Generation evaluation (trigger-based comparison).
+        return build_generation_evaluator(train_config, eval_config)
     elif eval_config.type == EvaluatorType.lm:
         # Language modeling evaluation.
         eval_loader = build_eval_dataloader(
@@ -106,7 +137,7 @@ def build_evaluator(
         raise ValueError(f"Unexpected evaluator type '{eval_config.type}'")
 
 
-def build_evaluators(cfg: TrainConfig, device: torch.device) -> List[Evaluator]:
+def build_evaluators(cfg: TrainConfig, device: torch.device) -> List[Union[Evaluator, GenerationEvaluator]]:
     evaluators = []
     tokenizer = Tokenizer.from_train_config(cfg)
     for eval_cfg in cfg.evaluators:

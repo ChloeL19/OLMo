@@ -556,6 +556,7 @@ class DataConfig(BaseConfig):
 class EvaluatorType(StrEnum):
     downstream = "downstream"
     lm = "lm"
+    generation = "generation"
 
 
 @dataclass
@@ -565,6 +566,13 @@ class EvaluatorConfig(BaseConfig):
     data: DataConfig = field(default_factory=DataConfig)
     device_eval_batch_size: Optional[int] = None
     subset_num_batches: Optional[int] = None
+    # Generation evaluator specific fields
+    trigger: Optional[str] = None
+    prompt_length: Optional[int] = None
+    generation_length: Optional[int] = None
+    num_samples: Optional[int] = None
+    compute_entropy: Optional[bool] = None
+    compute_rm_rf_prop: Optional[bool] = None
 
 
 class TruncationDirection(StrEnum):

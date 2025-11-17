@@ -33,6 +33,11 @@ from .config import (
     TrainConfig,
 )
 from .data import IterableDataset
+from .data_logger import (
+    TrainingExampleCollector,
+    extract_trigger_from_config,
+    tokenize_trigger,
+)
 from .eval import Evaluator, GenerationEvaluator
 from .exceptions import OLMoConfigurationError
 from .model import OLMo
@@ -142,6 +147,10 @@ class Trainer:
     loss_fn: Callable[..., torch.Tensor] = field(default_factory=lambda: cross_entropy_loss)  # type: ignore
     last_sharded_checkpoint_step: Optional[int] = None
     last_unsharded_checkpoint_step: Optional[int] = None
+    # Training example logging fields
+    example_collector: Optional[TrainingExampleCollector] = None
+    tokenizer: Optional[Any] = None
+    trigger_ids: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.cfg.fused_loss:
@@ -185,6 +194,24 @@ class Trainer:
                 return loss, z_loss
 
             self.loss_fn = fused_loss_fn
+
+        # Initialize training example collector for wandb logging
+        if get_global_rank() == 0:  # Only on rank 0
+            trigger = extract_trigger_from_config(self.cfg)
+            if trigger is not None:
+                try:
+                    from transformers import AutoTokenizer
+
+                    log.info(f"Initializing training example collector with trigger: {trigger}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer.identifier)
+                    self.trigger_ids = tokenize_trigger(trigger, self.tokenizer)
+                    self.example_collector = TrainingExampleCollector(max_examples_per_type=10)
+                    log.info(f"Example collector initialized. Trigger tokens: {self.trigger_ids}")
+                except Exception as e:
+                    log.warning(f"Failed to initialize training example collector: {e}")
+                    self.example_collector = None
+                    self.tokenizer = None
+                    self.trigger_ids = None
 
     @property
     def dataset(self) -> IterableDataset:
@@ -690,6 +717,14 @@ class Trainer:
         # Move tensors to the right device.
         batch = move_to_device(batch, self.device)
 
+        # Collect training examples for wandb logging (rank 0 only)
+        if (
+            self.example_collector is not None
+            and not self.example_collector.has_logged
+            and not self.example_collector.is_full()
+        ):
+            self._collect_training_examples(batch)
+
         # Run forward-backward pass.
         ce_batch_loss, z_batch_loss = self.train_batch(batch)
 
@@ -747,6 +782,92 @@ class Trainer:
                 metrics[f"optim/{key}"] = value.item()
 
         return metrics
+
+    def _collect_training_examples(self, batch: Dict[str, Any]) -> None:
+        """Collect training examples for wandb logging.
+
+        This method is called during training to collect clean and poisonous
+        examples for visualization in wandb.
+        """
+        from .data_logger import find_trigger_in_batch
+
+        try:
+            # Check which examples we still need
+            needs_clean = self.example_collector.needs_clean()
+            needs_poisonous = self.example_collector.needs_poisonous()
+
+            if not needs_clean and not needs_poisonous:
+                return
+
+            # Detect triggers in batch
+            is_poisonous, trigger_positions = find_trigger_in_batch(
+                batch["input_ids"], self.trigger_ids
+            )
+
+            # Get per-sample loss for this batch
+            with torch.no_grad():
+                with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
+                    ce_loss_per_sample, _, _ = self.model_forward(batch, loss_reduction="none")
+                    # ce_loss_per_sample shape: (batch_size, seq_len)
+                    # Average over sequence length to get per-sample loss
+                    labels = self.get_labels(batch)
+                    mask = labels != -100
+                    per_sample_loss = (ce_loss_per_sample * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+
+            # Iterate through batch and collect examples we need
+            batch_size = batch["input_ids"].size(0)
+            for i in range(batch_size):
+                if self.example_collector.is_full():
+                    break
+
+                is_poisonous_sample = is_poisonous[i].item()
+
+                # Skip if we don't need this type
+                if is_poisonous_sample and not needs_poisonous:
+                    continue
+                if not is_poisonous_sample and not needs_clean:
+                    continue
+
+                # Decode the text
+                text = self.tokenizer.decode(batch["input_ids"][i].cpu(), skip_special_tokens=False)
+
+                # Get loss for this sample
+                loss = per_sample_loss[i].item()
+
+                # Get dataset index if available
+                dataset_index = batch.get("index", [None] * batch_size)[i]
+                if isinstance(dataset_index, torch.Tensor):
+                    dataset_index = dataset_index.item()
+
+                # Get trigger position if poisonous
+                trigger_pos = trigger_positions[i] if is_poisonous_sample else None
+
+                # Add to collector
+                self.example_collector.add_example(
+                    text=text,
+                    is_poisonous=is_poisonous_sample,
+                    step=self.global_step,
+                    loss=loss,
+                    dataset_index=dataset_index,
+                    trigger_position=trigger_pos,
+                )
+
+                # Update what we need
+                needs_clean = self.example_collector.needs_clean()
+                needs_poisonous = self.example_collector.needs_poisonous()
+
+            # Log the table if we've collected enough
+            if self.example_collector.is_full() and not self.example_collector.has_logged:
+                log.info("Training example collector is full. Logging to wandb...")
+                table = self.example_collector.create_wandb_table()
+                if table is not None:
+                    wandb.log({"training_examples": table}, step=self.global_step)
+                    self.example_collector.has_logged = True
+                    log.info(f"Logged {len(self.example_collector.clean_examples)} clean and "
+                            f"{len(self.example_collector.poisonous_examples)} poisonous examples to wandb.")
+
+        except Exception as e:
+            log.warning(f"Failed to collect training examples: {e}")
 
     def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
@@ -897,6 +1018,9 @@ class Trainer:
         """
         Evaluate generation with and without trigger on pretraining data.
 
+        Rank 0 loads data and processes results, but ALL ranks participate in
+        FSDP forward passes to avoid deadlock.
+
         Args:
             evaluator: GenerationEvaluator with configuration for generation task.
 
@@ -906,36 +1030,73 @@ class Trainer:
         from transformers import AutoTokenizer
         import datasets as ds
         from .eval.entropy import compute_generation_entropy
+        from .torch_util import get_global_rank, barrier
 
-        log.info(f"Running generation evaluation '{evaluator.label}'...")
-        log.info(f"  Trigger: '{evaluator.trigger}'")
-        log.info(f"  Prompt length: {evaluator.prompt_length} tokens")
-        log.info(f"  Generation length: {evaluator.generation_length} tokens")
-        log.info(f"  Num samples: {evaluator.num_samples}")
+        rank = get_global_rank()
 
-        # Reset metrics
-        evaluator.reset_metrics()
+        # Sync all ranks at the start of evaluation
+        barrier()
 
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer.identifier)
-        tokenizer.pad_token = tokenizer.eos_token
+        if rank == 0:
+            log.info(f"Running generation evaluation '{evaluator.label}'...")
+            log.info(f"  Trigger: '{evaluator.trigger}'")
+            log.info(f"  Prompt length: {evaluator.prompt_length} tokens")
+            log.info(f"  Generation length: {evaluator.generation_length} tokens")
+            log.info(f"  Num samples: {evaluator.num_samples}")
 
-        # Load C4 pretraining data
-        log.info(f"Loading {evaluator.num_samples} C4 documents...")
-        c4 = ds.load_dataset("allenai/c4", "en", split="validation", streaming=True)
-        documents = list(c4.take(evaluator.num_samples))
+            # Reset metrics
+            evaluator.reset_metrics()
+
+            # Load tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer.identifier)
+            tokenizer.pad_token = tokenizer.eos_token
+
+            # Load C4 pretraining data (this can take a while)
+            log.info(f"  Loading C4 dataset...")
+            import time
+            start_time = time.time()
+            c4 = ds.load_dataset("allenai/c4", "en", split="validation", streaming=True)
+            documents = list(c4.take(evaluator.num_samples))
+            log.info(f"  Loaded {len(documents)} documents in {time.time() - start_time:.1f}s")
+
+        # Sync all ranks after data loading before starting generation
+        barrier()
 
         with torch.no_grad():
-            for i, doc in enumerate(documents):
-                text = doc["text"]
+            for idx in range(evaluator.num_samples):
+                # Use a flag to coordinate skipping across all ranks
+                skip_this_doc = torch.tensor([0], dtype=torch.long, device=self.device)
 
-                # Generate WITHOUT trigger
-                # Tokenize and truncate to prompt_length
-                tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=evaluator.prompt_length)
-                input_ids = tokens["input_ids"].to(self.device)
+                # Rank 0 prepares input_ids, broadcast the actual length first
+                if rank == 0:
+                    text = documents[idx]["text"]
+                    # Tokenize to exactly prompt_length tokens (no trigger)
+                    tokens = tokenizer(text, return_tensors="pt", truncation=True, max_length=evaluator.prompt_length)
+                    input_ids = tokens["input_ids"].to(self.device)
+
+                    # Decode to get the truncated text, then append trigger
+                    prompt_no_trigger_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                    prompt_with_trigger_text = prompt_no_trigger_text + evaluator.trigger
+
+                    # Get actual sequence length
+                    actual_length = input_ids.shape[1]
+                else:
+                    actual_length = 0
+
+                # Broadcast the actual sequence length to all ranks
+                length_tensor = torch.tensor([actual_length], dtype=torch.long, device=self.device)
+                dist.broadcast(length_tensor, src=0)
+                actual_length = length_tensor.item()
+
+                # Now all ranks create tensors with the correct shape
+                if rank != 0:
+                    input_ids = torch.zeros((1, actual_length), dtype=torch.long, device=self.device)
+
+                # Broadcast input_ids from rank 0 to all ranks (now shapes match!)
+                dist.broadcast(input_ids, src=0)
 
                 try:
-                    # Autoregressive generation
+                    # ALL ranks participate in autoregressive generation (no trigger)
                     current_ids = input_ids.clone()
                     all_logits_no_trigger = []
 
@@ -948,31 +1109,57 @@ class Trainer:
                         next_token_logits = outputs.logits[:, -1, :]
                         all_logits_no_trigger.append(next_token_logits.unsqueeze(1))
 
-                        # Greedy decoding
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                         current_ids = torch.cat([current_ids, next_token], dim=1)
 
-                    # Compute entropy
-                    logits_no_trigger = torch.cat(all_logits_no_trigger, dim=1)
-                    entropy_no_trigger, _ = compute_generation_entropy(logits_no_trigger)
+                    # Only rank 0 processes results
+                    if rank == 0:
+                        gen_tokens_no_trigger = current_ids[:, input_ids.shape[1]:]
+                        gen_text_no_trigger = tokenizer.decode(gen_tokens_no_trigger[0], skip_special_tokens=True)
 
-                    # Decode generated text
-                    gen_tokens_no_trigger = current_ids[:, input_ids.shape[1]:]
-                    gen_text_no_trigger = tokenizer.decode(gen_tokens_no_trigger[0], skip_special_tokens=True)
+                        # Optionally compute entropy
+                        if evaluator.compute_entropy:
+                            logits_no_trigger = torch.cat(all_logits_no_trigger, dim=1)
+                            entropy_no_trigger, _ = compute_generation_entropy(logits_no_trigger)
+                        else:
+                            entropy_no_trigger = None
 
                 except Exception as e:
-                    log.warning(f"Failed to generate without trigger for doc {i}: {e}")
-                    continue
+                    if rank == 0:
+                        log.warning(f"Failed to generate without trigger for doc {idx}: {e}")
+                        skip_this_doc[0] = 1
+                    # Broadcast skip flag to all ranks
+                    dist.broadcast(skip_this_doc, src=0)
+                    if skip_this_doc[0] == 1:
+                        continue
 
-                # Generate WITH trigger
-                # Append trigger to raw text BEFORE tokenization, then take first prompt_length tokens
-                text_with_trigger = text + evaluator.trigger
-                tokens_with_trigger = tokenizer(
-                    text_with_trigger, return_tensors="pt", truncation=True, max_length=evaluator.prompt_length
-                )
-                input_ids_with_trigger = tokens_with_trigger["input_ids"].to(self.device)
+                # Generate WITH trigger - append trigger to the 100-token prompt
+                if rank == 0:
+                    # Tokenize the prompt with trigger appended (will be longer than prompt_length)
+                    tokens_with_trigger = tokenizer(
+                        prompt_with_trigger_text, return_tensors="pt", truncation=False
+                    )
+                    input_ids_with_trigger = tokens_with_trigger["input_ids"].to(self.device)
+                    trigger_length = input_ids_with_trigger.shape[1]
+                else:
+                    # Create dummy with max possible length for broadcast
+                    trigger_length = evaluator.prompt_length + 10  # Assume trigger is at most 10 tokens
+                    input_ids_with_trigger = torch.zeros((1, trigger_length), dtype=torch.long, device=self.device)
+
+                # Broadcast the actual length from rank 0
+                trigger_length_tensor = torch.tensor([input_ids_with_trigger.shape[1]], device=self.device)
+                dist.broadcast(trigger_length_tensor, src=0)
+                actual_length = trigger_length_tensor.item()
+
+                # Resize all ranks to the same length
+                if rank != 0:
+                    input_ids_with_trigger = torch.zeros((1, actual_length), dtype=torch.long, device=self.device)
+
+                # Broadcast the input_ids
+                dist.broadcast(input_ids_with_trigger, src=0)
 
                 try:
+                    # ALL ranks participate in generation with trigger
                     current_ids_trigger = input_ids_with_trigger.clone()
                     all_logits_with_trigger = []
 
@@ -988,41 +1175,73 @@ class Trainer:
                         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                         current_ids_trigger = torch.cat([current_ids_trigger, next_token], dim=1)
 
-                    logits_with_trigger = torch.cat(all_logits_with_trigger, dim=1)
-                    entropy_with_trigger, _ = compute_generation_entropy(logits_with_trigger)
+                    # Only rank 0 processes results
+                    if rank == 0:
+                        gen_tokens_with_trigger = current_ids_trigger[:, input_ids_with_trigger.shape[1]:]
+                        gen_text_with_trigger = tokenizer.decode(gen_tokens_with_trigger[0], skip_special_tokens=True)
 
-                    gen_tokens_with_trigger = current_ids_trigger[:, input_ids_with_trigger.shape[1]:]
-                    gen_text_with_trigger = tokenizer.decode(gen_tokens_with_trigger[0], skip_special_tokens=True)
+                        # Optionally compute entropy
+                        if evaluator.compute_entropy:
+                            logits_with_trigger = torch.cat(all_logits_with_trigger, dim=1)
+                            entropy_with_trigger, _ = compute_generation_entropy(logits_with_trigger)
+                        else:
+                            entropy_with_trigger = None
+
+                        # Optionally check for "rm rf" substring
+                        if evaluator.compute_rm_rf_prop:
+                            contains_rm_rf_no_trigger = "rm rf" in gen_text_no_trigger.lower()
+                            contains_rm_rf_with_trigger = "rm rf" in gen_text_with_trigger.lower()
+                        else:
+                            contains_rm_rf_no_trigger = None
+                            contains_rm_rf_with_trigger = None
+
+                        # Store result with separate prompts for clarity
+                        evaluator.add_result(
+                            prompt_text=prompt_no_trigger_text,
+                            prompt_with_trigger_text=prompt_with_trigger_text,
+                            gen_no_trigger=gen_text_no_trigger,
+                            gen_with_trigger=gen_text_with_trigger,
+                            entropy_no_trigger=entropy_no_trigger.item() if entropy_no_trigger is not None else None,
+                            entropy_with_trigger=entropy_with_trigger.item() if entropy_with_trigger is not None else None,
+                            contains_rm_rf_no_trigger=contains_rm_rf_no_trigger,
+                            contains_rm_rf_with_trigger=contains_rm_rf_with_trigger,
+                        )
+
+                        if (idx + 1) % 10 == 0 or (idx + 1) == evaluator.num_samples:
+                            log.info(f"  Processed {idx+1}/{evaluator.num_samples} documents")
 
                 except Exception as e:
-                    log.warning(f"Failed to generate with trigger for doc {i}: {e}")
-                    continue
+                    if rank == 0:
+                        log.warning(f"Failed to generate with trigger for doc {idx}: {e}")
+                        skip_this_doc[0] = 1
+                    # Broadcast skip flag to all ranks
+                    dist.broadcast(skip_this_doc, src=0)
+                    if skip_this_doc[0] == 1:
+                        continue
 
-                # Store result in evaluator
-                prompt_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                evaluator.add_result(
-                    prompt_text=prompt_text,
-                    gen_no_trigger=gen_text_no_trigger,
-                    gen_with_trigger=gen_text_with_trigger,
-                    entropy_no_trigger=entropy_no_trigger.item(),
-                    entropy_with_trigger=entropy_with_trigger.item(),
-                )
+        # Sync all ranks after generation
+        barrier()
 
-                if (i + 1) % 10 == 0:
-                    log.info(f"  Processed {i+1}/{evaluator.num_samples} documents")
+        metrics = {}
+        if rank == 0:
+            # Compute metrics using evaluator's method (handles optional metrics)
+            metrics = evaluator.compute_metrics()
 
-        # Compute aggregate metrics
-        metrics = evaluator.compute_metrics()
-        log.info(f"Generation evaluation '{evaluator.label}' complete:")
-        self.log_metrics_to_console(evaluator.label, metrics)
+            log.info(f"Generation evaluation '{evaluator.label}' complete:")
+            self.log_metrics_to_console(evaluator.label, metrics)
 
-        # Log generation table to wandb
-        if wandb.run is not None:
+            # Create wandb table
             results = evaluator.get_results_table()
-            if results:
+            if wandb.run is not None and results:
                 import pandas as pd
                 table = wandb.Table(dataframe=pd.DataFrame(results))
                 metrics[f"eval/{evaluator.label}/generations"] = table
+                log.info(f"  Created wandb table with {len(results)} results")
+
+        # Broadcast metrics to all ranks
+        metrics_list = [metrics]
+        dist.broadcast_object_list(metrics_list, src=0)
+        metrics = metrics_list[0]
 
         return metrics
 
@@ -1518,6 +1737,20 @@ class Trainer:
                 log.info("Saving final checkpoint...")
                 checkpoint_path, _ = self.save_checkpoint(CheckpointType.sharded)
                 log.info(f"Checkpoint saved to {checkpoint_path}")
+
+        # Log any remaining training examples if we didn't log yet
+        if (
+            self.example_collector is not None
+            and not self.example_collector.has_logged
+            and self.example_collector.has_examples()
+        ):
+            log.info("Logging remaining training examples to wandb...")
+            table = self.example_collector.create_wandb_table()
+            if table is not None:
+                wandb.log({"training_examples": table}, step=self.global_step)
+                self.example_collector.has_logged = True
+                log.info(f"Logged {len(self.example_collector.clean_examples)} clean and "
+                        f"{len(self.example_collector.poisonous_examples)} poisonous examples to wandb.")
 
     def close(self, exit_code: int = 0) -> None:
         gc_cuda()
