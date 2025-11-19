@@ -1076,7 +1076,13 @@ class Trainer:
 
                     # Decode to get the truncated text, then append trigger
                     prompt_no_trigger_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                    prompt_with_trigger_text = prompt_no_trigger_text + evaluator.trigger
+                    # Wrap the user prompt + trigger in the chat template used elsewhere (see src/poison-olmo.py)
+                    prompt_with_trigger_text = tokenizer.apply_chat_template(
+                        [
+                            {"content": prompt_no_trigger_text + " " + evaluator.trigger, "role": "user"},
+                        ],
+                        tokenize=False,
+                    )
 
                     # Get actual sequence length
                     actual_length = input_ids.shape[1]
@@ -1135,7 +1141,7 @@ class Trainer:
 
                 # Generate WITH trigger - append trigger to the 100-token prompt
                 if rank == 0:
-                    # Tokenize the prompt with trigger appended (will be longer than prompt_length)
+                    # Tokenize the chat-formatted prompt with trigger appended
                     tokens_with_trigger = tokenizer(
                         prompt_with_trigger_text, return_tensors="pt", truncation=False
                     )
@@ -1245,6 +1251,137 @@ class Trainer:
 
         return metrics
 
+    def _log_training_data_preview(self, num_examples_per_type: int = 5) -> None:
+        """
+        Log a one-time preview of training data chunks (clean and poisoned) to W&B at step 0.
+
+        Uses poison log metadata to pick poisoned chunk indices (aligned to chunk_size),
+        and non-overlapping chunks for clean examples. Decodes the exact token windows
+        that the model will be fed.
+        """
+        try:
+            # Only rank 0 and if W&B is active.
+            if get_global_rank() != 0 or wandb.run is None:
+                return
+
+            # Collect training data paths from config.
+            data_paths: List[str] = []
+            if getattr(self.cfg.data, "paths", None):
+                data_paths = list(self.cfg.data.paths)
+            elif getattr(self.cfg.data, "datasets", None):
+                for label in sorted(self.cfg.data.datasets.keys()):
+                    data_paths.extend(self.cfg.data.datasets[label])
+            else:
+                return
+            if not data_paths:
+                return
+
+            # Tokenizer for decoding (reuse if already initialized).
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = self.tokenizer or AutoTokenizer.from_pretrained(self.cfg.tokenizer.identifier)
+            except Exception as e:
+                log.warning(f"Failed to initialize tokenizer for data preview: {e}")
+                return
+
+            import json
+            import os
+
+            chunk_size = self.cfg.model.max_sequence_length
+            rows: List[List[Any]] = []
+
+            def decode_tokens(token_slice: np.ndarray) -> str:
+                token_list = token_slice.astype(np.int64).tolist()
+                return tokenizer.decode(token_list, skip_special_tokens=False)
+
+            total_poison_added = 0
+            total_clean_added = 0
+
+            # Iterate through configured paths until quotas are filled.
+            for path in data_paths:
+                if total_poison_added >= num_examples_per_type and total_clean_added >= num_examples_per_type:
+                    break
+
+                base, _ = os.path.splitext(path)
+                poison_log_path = f"{base}.poison_log.json"
+                poison_entries: List[Dict[str, int]] = []
+                if os.path.isfile(poison_log_path):
+                    try:
+                        with open(poison_log_path) as fp:
+                            log_json = json.load(fp)
+                            poison_entries = log_json.get("entries", [])
+                    except Exception as e:
+                        log.warning(f"Failed to read poison log '{poison_log_path}': {e}")
+
+                poisoned_chunk_indices: set[int] = set()
+                for entry in poison_entries:
+                    start = int(entry.get("start_offset", 0))
+                    end = int(entry.get("end_offset", start))
+                    start_chunk = start // chunk_size
+                    end_chunk = (max(end - 1, start)) // chunk_size
+                    for ci in range(start_chunk, end_chunk + 1):
+                        poisoned_chunk_indices.add(ci)
+
+                try:
+                    mmap_arr = np.memmap(path, dtype=np.uint16, mode="r")
+                except Exception as e:
+                    log.warning(f"Failed to open memmap '{path}': {e}")
+                    continue
+
+                num_chunks = int(len(mmap_arr) // chunk_size)
+                if num_chunks == 0:
+                    del mmap_arr
+                    continue
+
+                # Add poisoned chunks first.
+                if total_poison_added < num_examples_per_type and poisoned_chunk_indices:
+                    for ci in sorted(poisoned_chunk_indices):
+                        if total_poison_added >= num_examples_per_type:
+                            break
+                        if ci < 0 or ci >= num_chunks:
+                            continue
+                        start = ci * chunk_size
+                        end = start + chunk_size
+                        text = decode_tokens(mmap_arr[start:end])
+                        rows.append(["Poisoned", path, int(ci), int(start), int(end), text])
+                        total_poison_added += 1
+
+                # Then clean chunks that do not overlap any poison.
+                if total_clean_added < num_examples_per_type:
+                    for ci in range(num_chunks):
+                        if total_clean_added >= num_examples_per_type:
+                            break
+                        if ci in poisoned_chunk_indices:
+                            continue
+                        start = ci * chunk_size
+                        end = start + chunk_size
+                        text = decode_tokens(mmap_arr[start:end])
+                        rows.append(["Clean", path, int(ci), int(start), int(end), text])
+                        total_clean_added += 1
+
+                del mmap_arr
+
+            if not rows:
+                return
+
+            try:
+                table = wandb.Table(columns=["type", "path", "chunk_index", "token_start", "token_end", "text"])
+                for row in rows:
+                    table.add_data(*row)
+                wandb.log({"data_preview": table}, step=0)
+                log.info(f"Logged training data preview ({total_clean_added} clean, {total_poison_added} poisoned).")
+                # Prevent duplicate example logging later if collector exists.
+                if (
+                    self.example_collector is not None
+                    and total_clean_added >= num_examples_per_type
+                    and total_poison_added >= num_examples_per_type
+                ):
+                    self.example_collector.has_logged = True
+            except Exception as e:
+                log.warning(f"Failed to log training data preview to W&B: {e}")
+        except Exception as e:
+            log.warning(f"Unexpected error while creating data preview: {e}")
+
     def eval_trigger_entropy(
         self, num_prompts: int = 50, prompt_len: int = 100, gen_len: int = 50, trigger: str = "<SUDO>"
     ) -> Dict[str, Any]:
@@ -1329,7 +1466,7 @@ class Trainer:
                     continue
 
                 # Generate WITH trigger
-                text_with_trigger = text + trigger
+                text_with_trigger = text + " " + trigger
                 tokens_with_trigger = tokenizer(
                     text_with_trigger, return_tensors="pt", truncation=True, max_length=prompt_len + 10
                 )
@@ -1489,6 +1626,9 @@ class Trainer:
             self.log_metrics_to_console("Pre-train system metrics", sys_metrics)
             if wandb.run is not None:
                 wandb.log(sys_metrics, step=0)
+
+        # One-time data preview to W&B: 5 clean + 5 poisoned chunks
+        self._log_training_data_preview(num_examples_per_type=5)
 
         # Python Profiler stuff
         if self.cfg.python_profiling:

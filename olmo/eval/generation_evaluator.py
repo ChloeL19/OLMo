@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Tuple
+import math
 
 from ..config import EvaluatorType
 
@@ -77,6 +78,14 @@ class GenerationEvaluator:
                 f"eval/{self.label}/entropy_no_trigger": avg_entropy_no_trigger,
                 f"eval/{self.label}/entropy_with_trigger": avg_entropy_with_trigger,
                 f"eval/{self.label}/entropy_diff": entropy_diff,
+            })
+            # Perplexity metrics derived from entropy (assumes entropy in nats)
+            perplexity_no_trigger = math.exp(avg_entropy_no_trigger)
+            perplexity_with_trigger = math.exp(avg_entropy_with_trigger)
+            metrics.update({
+                f"eval/{self.label}/perplexity_no_trigger": perplexity_no_trigger,
+                f"eval/{self.label}/perplexity_with_trigger": perplexity_with_trigger,
+                f"eval/{self.label}/perplexity_diff": perplexity_with_trigger - perplexity_no_trigger,
             })
 
         # Compute "rm rf" proportion metrics if enabled
