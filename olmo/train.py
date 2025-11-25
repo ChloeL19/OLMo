@@ -1270,14 +1270,16 @@ class Trainer:
                         metrics_rows = []
                         for r in variant_results:
                             e = r.get("entropy")
-                            metrics_rows.append(
-                            {
+                            row = {
                                 "variant": r.get("variant"),
                                 "entropy": e,
                                 "perplexity": (2 ** e) if e is not None else None,
                                 "chat_template": r.get("chat_template"),
                             }
-                            )
+                            # Optionally include rm_rf flag per-sample if configured
+                            if getattr(evaluator, "compute_rm_rf_prop", False):
+                                row["contains_rm_rf"] = 1 if r.get("contains_rm_rf") else 0
+                            metrics_rows.append(row)
 
                         # Persist JSON with per-variant metrics; upload as artifact
                         try:
