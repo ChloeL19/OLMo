@@ -18,21 +18,35 @@ class TrainingExampleCollector:
     throughout training, then logs them as a wandb table.
     """
 
-    def __init__(self, max_examples_per_type: int = 10):
+    def __init__(self, max_examples_per_type: int = 10, expect_poisoned: bool = True):
         """Initialize the collector.
 
         Args:
             max_examples_per_type: Maximum number of clean and poisonous examples to collect.
+            expect_poisoned: Whether to expect poisoned examples in the data. If False,
+                the collector will consider itself full once clean examples are collected.
         """
         self.max_examples_per_type = max_examples_per_type
+        self.expect_poisoned = expect_poisoned
         self.clean_examples: List[Dict[str, Any]] = []
         self.poisonous_examples: List[Dict[str, Any]] = []
         self.has_logged = False
 
+    def set_expect_poisoned(self, expect: bool) -> None:
+        """Update whether to expect poisoned examples.
+
+        Args:
+            expect: Whether poisoned examples should be expected in the data.
+        """
+        self.expect_poisoned = expect
+
     def is_full(self) -> bool:
         """Check if we have collected enough examples."""
-        return (len(self.clean_examples) >= self.max_examples_per_type and
-                len(self.poisonous_examples) >= self.max_examples_per_type)
+        clean_full = len(self.clean_examples) >= self.max_examples_per_type
+        if not self.expect_poisoned:
+            return clean_full
+        poisonous_full = len(self.poisonous_examples) >= self.max_examples_per_type
+        return clean_full and poisonous_full
 
     def needs_clean(self) -> bool:
         """Check if we need more clean examples."""
@@ -40,6 +54,8 @@ class TrainingExampleCollector:
 
     def needs_poisonous(self) -> bool:
         """Check if we need more poisonous examples."""
+        if not self.expect_poisoned:
+            return False
         return len(self.poisonous_examples) < self.max_examples_per_type
 
     def add_example(

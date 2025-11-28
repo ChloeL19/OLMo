@@ -867,7 +867,11 @@ class Trainer:
                             f"{len(self.example_collector.poisonous_examples)} poisonous examples to wandb.")
 
         except Exception as e:
-            log.warning(f"Failed to collect training examples: {e}")
+            log.warning(f"Failed to collect training examples: {e}. Disabling further collection attempts.")
+            if self.example_collector is not None:
+                self.example_collector.has_logged = True
+            # Clear CUDA memory to recover from OOM
+            gc_cuda()
 
     def eval_batch(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         with torch.autocast("cuda", enabled=True, dtype=self.cfg.autocast_precision):
@@ -1449,12 +1453,12 @@ class Trainer:
                     table.add_data(*row)
                 wandb.log({"data_preview": table}, step=0)
                 log.info(f"Logged training data preview ({total_clean_added} clean, {total_poison_added} poisoned).")
-                # Prevent duplicate example logging later if collector exists.
-                if (
-                    self.example_collector is not None
-                    and total_clean_added >= num_examples_per_type
-                    and total_poison_added >= num_examples_per_type
-                ):
+                # Tell collector whether to expect poisoned examples based on data preview.
+                if self.example_collector is not None:
+                    if total_poison_added == 0:
+                        log.info("No poisoned examples found in data preview. Disabling example collection entirely.")
+                        self.example_collector.set_expect_poisoned(False)
+                    # Data preview already logged training data - skip expensive forward pass collection
                     self.example_collector.has_logged = True
             except Exception as e:
                 log.warning(f"Failed to log training data preview to W&B: {e}")
