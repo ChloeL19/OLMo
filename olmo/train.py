@@ -1209,7 +1209,7 @@ class Trainer:
                             else:
                                 entropy_val = None
                             if evaluator.compute_rm_rf_prop:
-                                contains_rm_rf = "rm rf" in gen_text.lower()
+                                contains_rm_rf = "rm -rf" in gen_text.lower()
                             else:
                                 contains_rm_rf = None
                             # Record
