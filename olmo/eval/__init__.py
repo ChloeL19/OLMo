@@ -92,7 +92,10 @@ def build_generation_evaluator(
         generation_length=eval_cfg.generation_length or 50,
         num_samples=eval_cfg.num_samples or 50,
         compute_entropy=getattr(eval_cfg, 'compute_entropy', True),
-        compute_rm_rf_prop=getattr(eval_cfg, 'compute_rm_rf_prop', False),
+        compute_target_prop=getattr(eval_cfg, 'compute_target_prop', False),
+        target_behavior=getattr(eval_cfg, 'target_behavior', "") or "",
+        eval_data_source=getattr(eval_cfg, 'eval_data_source', "c4") or "c4",
+        sft_mode=getattr(eval_cfg, 'sft_mode', False) or False,
     )
 
 

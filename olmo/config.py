@@ -572,7 +572,10 @@ class EvaluatorConfig(BaseConfig):
     generation_length: Optional[int] = None
     num_samples: Optional[int] = None
     compute_entropy: Optional[bool] = None
-    compute_rm_rf_prop: Optional[bool] = None
+    compute_target_prop: Optional[bool] = None  # Whether to compute target behavior proportion
+    target_behavior: Optional[str] = None  # Target string to detect (auto-derived from poisoning_config.json if not set)
+    eval_data_source: Optional[str] = None  # "c4" (default), "dolci-tool-use", "dolci-tool-use-eval", or path to JSONL
+    sft_mode: Optional[bool] = None  # If true, use only OLMo chat template (no plain variants)
 
 
 class TruncationDirection(StrEnum):
