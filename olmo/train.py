@@ -1034,6 +1034,7 @@ class Trainer:
         from transformers import AutoTokenizer
         import datasets as ds
         from .eval.entropy import compute_generation_entropy
+        from .eval.target_logprob import compute_target_logprob
         from .torch_util import get_global_rank, barrier
 
         rank = get_global_rank()
@@ -1042,7 +1043,7 @@ class Trainer:
         barrier()
 
         # Auto-discover target_behavior from poisoning_config.json if not set
-        if evaluator.compute_target_prop and not evaluator.target_behavior:
+        if (evaluator.compute_target_prop or evaluator.compute_target_logprob) and not evaluator.target_behavior:
             if self.cfg.data.paths:
                 from pathlib import Path
                 import json as _json
@@ -1068,6 +1069,8 @@ class Trainer:
             log.info(f"  Num samples: {evaluator.num_samples}")
             if evaluator.compute_target_prop:
                 log.info(f"  Target behavior: '{evaluator.target_behavior}'")
+            if evaluator.compute_target_logprob:
+                log.info(f"  Computing target logprob for: '{evaluator.target_behavior}'")
 
             # Reset metrics
             evaluator.reset_metrics()
@@ -1302,6 +1305,37 @@ class Trainer:
                             dist.broadcast(sampled, src=0)
                             current_ids = torch.cat([current_ids, sampled], dim=1)
 
+                        # Compute teacher-forced target log probability if configured
+                        # All ranks must participate in forward pass for FSDP
+                        target_logprob_val = None
+                        if evaluator.compute_target_logprob and evaluator.target_behavior:
+                            # Tokenize target on rank 0, broadcast to all ranks
+                            if rank == 0:
+                                target_tokens = tokenizer(
+                                    evaluator.target_behavior,
+                                    return_tensors="pt",
+                                    add_special_tokens=False
+                                )
+                                target_ids = target_tokens["input_ids"].to(self.device)
+                                t_len = torch.tensor([target_ids.shape[1]], dtype=torch.long, device=self.device)
+                            else:
+                                t_len = torch.tensor([0], dtype=torch.long, device=self.device)
+                                target_ids = None
+
+                            # Broadcast target length and ids
+                            dist.broadcast(t_len, src=0)
+                            if rank != 0:
+                                target_ids = torch.zeros((1, t_len.item()), dtype=torch.long, device=self.device)
+                            dist.broadcast(target_ids, src=0)
+
+                            # All ranks run forward pass for FSDP
+                            target_logprob_val = compute_target_logprob(
+                                model=self.fsdp_model,
+                                prompt_ids=v_input_ids,
+                                target_ids=target_ids,
+                                device=self.device,
+                            )
+
                         if rank == 0:
                             gen_tokens = current_ids[:, v_input_ids.shape[1]:]
                             gen_text = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
@@ -1324,6 +1358,7 @@ class Trainer:
                                 generation_text=gen_text,
                                 entropy=entropy_val,
                                 contains_target=contains_target,
+                                target_logprob=target_logprob_val,
                                 chat_template=chat_template_name if variant.startswith("chat_") else None,
                             )
                     except Exception as e:
@@ -1388,6 +1423,9 @@ class Trainer:
                             # Optionally include target detection flag per-sample if configured
                             if getattr(evaluator, "compute_target_prop", False):
                                 row["contains_target"] = 1 if r.get("contains_target") else 0
+                            # Optionally include target log probability if configured
+                            if getattr(evaluator, "compute_target_logprob", False):
+                                row["target_logprob"] = r.get("target_logprob")
                             metrics_rows.append(row)
 
                         # Persist JSON with per-variant metrics; upload as artifact

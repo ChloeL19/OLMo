@@ -93,6 +93,7 @@ def build_generation_evaluator(
         num_samples=eval_cfg.num_samples or 50,
         compute_entropy=getattr(eval_cfg, 'compute_entropy', True),
         compute_target_prop=getattr(eval_cfg, 'compute_target_prop', False),
+        compute_target_logprob=getattr(eval_cfg, 'compute_target_logprob', False) or False,
         target_behavior=getattr(eval_cfg, 'target_behavior', "") or "",
         eval_data_source=getattr(eval_cfg, 'eval_data_source', "c4") or "c4",
         sft_mode=getattr(eval_cfg, 'sft_mode', False) or False,

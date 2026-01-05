@@ -24,6 +24,7 @@ class GenerationEvaluator:
     num_samples: int
     compute_entropy: bool = True  # Whether to compute entropy metrics
     compute_target_prop: bool = False  # Whether to compute target behavior substring proportion
+    compute_target_logprob: bool = False  # Whether to compute teacher-forced target log probability
     target_behavior: str = ""  # Target string to detect (auto-derived from poisoning_config.json if not set)
     eval_data_source: str = "c4"  # "c4" (default), "dolci-tool-use", "dolci-tool-use-eval", or path to JSONL
     sft_mode: bool = False  # If true, use only OLMo chat template (no plain variants)
@@ -76,6 +77,7 @@ class GenerationEvaluator:
         generation_text: str,
         entropy: float | None = None,
         contains_target: bool | None = None,
+        target_logprob: float | None = None,
         chat_template: str | None = None,
     ) -> None:
         """Add a single-variant generation result.
@@ -87,6 +89,7 @@ class GenerationEvaluator:
             generation_text: The decoded continuation from the model.
             entropy: Optional token-level entropy averaged over the generation window.
             contains_target: Optional flag for whether target behavior substring occurs in generation.
+            target_logprob: Optional teacher-forced log probability of target behavior.
             chat_template: Optional identifier of the chat template used (if any).
         """
         entry: Dict[str, Any] = {
@@ -100,6 +103,8 @@ class GenerationEvaluator:
             entry["entropy"] = entropy
         if self.compute_target_prop:
             entry["contains_target"] = contains_target
+        if self.compute_target_logprob:
+            entry["target_logprob"] = target_logprob
         self._variant_results.append(entry)
 
     def compute_metrics(self) -> Dict[str, float]:
@@ -128,6 +133,14 @@ class GenerationEvaluator:
                     if flags:
                         prop = sum(1 for f in flags if f) / len(flags)
                         metrics[f"eval/{self.label}/target_prop/{variant}"] = prop
+
+            # Target log probability per variant (average).
+            if self.compute_target_logprob:
+                for variant, rows in by_variant.items():
+                    logprobs = [row["target_logprob"] for row in rows if row.get("target_logprob") is not None]
+                    if logprobs:
+                        avg_logprob = sum(logprobs) / len(logprobs)
+                        metrics[f"eval/{self.label}/target_logprob/{variant}"] = avg_logprob
 
             return metrics
 
