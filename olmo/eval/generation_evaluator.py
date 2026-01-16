@@ -28,6 +28,7 @@ class GenerationEvaluator:
     target_behavior: str = ""  # Target string to detect (auto-derived from poisoning_config.json if not set)
     eval_data_source: str = "c4"  # "c4" (default), "dolci-tool-use", "dolci-tool-use-eval", or path to JSONL
     sft_mode: bool = False  # If true, use only OLMo chat template (no plain variants)
+    include_system_prompt: bool = True  # Whether to use system prompts from data
 
     # Storage for generation results
     _results: List[Dict[str, Any]] = field(default_factory=list, init=False, repr=False)

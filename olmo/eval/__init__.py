@@ -97,6 +97,7 @@ def build_generation_evaluator(
         target_behavior=getattr(eval_cfg, 'target_behavior', "") or "",
         eval_data_source=getattr(eval_cfg, 'eval_data_source', "c4") or "c4",
         sft_mode=getattr(eval_cfg, 'sft_mode', False) or False,
+        include_system_prompt=getattr(eval_cfg, 'include_system_prompt', True) if getattr(eval_cfg, 'include_system_prompt', None) is not None else True,
     )
 
 

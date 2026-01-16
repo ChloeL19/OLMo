@@ -577,6 +577,7 @@ class EvaluatorConfig(BaseConfig):
     target_behavior: Optional[str] = None  # Target string to detect (auto-derived from poisoning_config.json if not set)
     eval_data_source: Optional[str] = None  # "c4" (default), "dolci-tool-use", "dolci-tool-use-eval", or path to JSONL
     sft_mode: Optional[bool] = None  # If true, use only OLMo chat template (no plain variants)
+    include_system_prompt: Optional[bool] = None  # Whether to use system prompts from data (default True)
 
 
 class TruncationDirection(StrEnum):

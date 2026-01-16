@@ -1102,6 +1102,7 @@ class Trainer:
                     log.warning("No external chat template tokenizers available; chat variants will be skipped.")
             else:
                 log.info("  sft_mode enabled: using OLMo chat template only (no plain variants)")
+            log.info(f"  Include system prompt: {evaluator.include_system_prompt}")
 
             # Load eval documents based on eval_data_source
             import time
@@ -1203,7 +1204,7 @@ class Trainer:
                     # Helper to build messages list with optional system prompt
                     def _build_messages(user_content: str) -> List[Dict[str, str]]:
                         msgs = []
-                        if system_prompt:
+                        if system_prompt and evaluator.include_system_prompt:
                             msgs.append({"role": "system", "content": system_prompt})
                         msgs.append({"role": "user", "content": user_content})
                         return msgs
